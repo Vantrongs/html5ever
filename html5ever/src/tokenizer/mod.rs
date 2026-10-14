@@ -28,6 +28,7 @@ use markup5ever::{ns, small_char_set, TokenizerResult};
 use std::borrow::Cow::{self, Borrowed};
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::mem;
 
 pub use crate::buffer_queue::{BufferQueue, FromSet, NotFromSet, SetResult};
@@ -110,6 +111,18 @@ impl Default for TokenizerOpts {
 /// and it costs at most this many comparisons per attribute.
 const MIN_ATTRS_TO_DEDUP_WITH_SET: usize = 128;
 
+/// An attribute name in the set of a tag's names, hashed by its text. The hash
+/// of the atom itself does not do: string_cache 0.9 folds an atom of up to seven
+/// bytes into 32 bits, which many chosen names share.
+#[derive(PartialEq, Eq)]
+struct AttrName(LocalName);
+
+impl Hash for AttrName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (*self.0).hash(state)
+    }
+}
+
 /// The HTML tokenizer.
 pub struct Tokenizer<Sink> {
     /// Options controlling the behavior of the tokenizer.
@@ -160,7 +173,7 @@ pub struct Tokenizer<Sink> {
 
     /// Names of the current tag's attributes, filled once the tag has
     /// `MIN_ATTRS_TO_DEDUP_WITH_SET` attributes and empty before that.
-    current_tag_attr_names: RefCell<HashSet<LocalName>>,
+    current_tag_attr_names: RefCell<HashSet<AttrName>>,
 
     /// Current attribute name.
     current_attr_name: RefCell<StrTendril>,
@@ -572,9 +585,9 @@ impl<Sink: TokenSink> Tokenizer<Sink> {
                 // cost time quadratic in its attribute count.
                 let mut names = self.current_tag_attr_names.borrow_mut();
                 if names.is_empty() {
-                    names.extend(attrs.iter().map(|a| a.name.local.clone()));
+                    names.extend(attrs.iter().map(|a| AttrName(a.name.local.clone())));
                 }
-                !names.insert(name.clone())
+                !names.insert(AttrName(name.clone()))
             }
         };
 
@@ -2394,31 +2407,55 @@ mod test {
         assert_eq!(*sink.errors.borrow(), vec!["Duplicate attribute"; 3]);
     }
 
-    #[test]
-    fn many_attributes_take_linear_time() {
-        fn seconds(attrs: usize) -> f64 {
-            let mut input = String::from("<p");
-            for i in 0..attrs {
-                input.push_str(&format!(" a{i}=x"));
-            }
-            input.push('>');
-            (0..3)
-                .map(|_| {
-                    let start = std::time::Instant::now();
-                    let sink = tokenize_tags(&input);
-                    let elapsed = start.elapsed().as_secs_f64();
-                    assert_eq!(sink.tags.borrow()[0].attrs.len(), attrs);
-                    elapsed
-                })
-                .fold(f64::INFINITY, f64::min)
+    /// Seconds to tokenize one tag with an attribute of each name, best of three
+    /// runs, checking that every attribute is kept.
+    fn seconds_for_a_tag_with(names: &[String]) -> f64 {
+        let mut input = String::from("<p");
+        for name in names {
+            input.push_str(&format!(" {name}=x"));
         }
-        // Four times the attributes take about four times as long in linear
-        // time and sixteen times as long in quadratic time.
-        let ratio = seconds(64_000) / seconds(16_000);
+        input.push('>');
+        (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                let sink = tokenize_tags(&input);
+                let elapsed = start.elapsed().as_secs_f64();
+                assert_eq!(sink.tags.borrow()[0].attrs.len(), names.len());
+                elapsed
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Four times the attributes take about four times as long in linear time
+    /// and sixteen times as long in quadratic time.
+    fn assert_linear_in_attributes(n: usize, name: impl Fn(usize) -> String) {
+        let names: Vec<String> = (0..4 * n).map(name).collect();
+        let ratio = seconds_for_a_tag_with(&names) / seconds_for_a_tag_with(&names[..n]);
         assert!(
             ratio < 8.0,
-            "64k attributes took {ratio:.1} times as long as 16k"
+            "{} attributes took {ratio:.1} times as long as {n}",
+            4 * n
         );
+    }
+
+    #[test]
+    fn many_attributes_take_linear_time() {
+        assert_linear_in_attributes(16_000, |i| format!("a{i}"));
+    }
+
+    #[test]
+    fn attributes_whose_atoms_hash_alike_take_linear_time() {
+        // string_cache 0.9 hashes an atom of up to seven bytes to the XOR of the
+        // two halves of its 64-bit form, so the names `abc` + `z` + `abc`, for
+        // any three characters `abc`, all hash alike.
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        assert_linear_in_attributes(8_000, |i| {
+            let abc: String = [i / 1296, i / 36 % 36, i % 36]
+                .iter()
+                .map(|&d| CHARS[d] as char)
+                .collect();
+            format!("{abc}z{abc}")
+        });
     }
 
     #[test]
