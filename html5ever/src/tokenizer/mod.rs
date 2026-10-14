@@ -27,7 +27,7 @@ use log::{debug, trace};
 use markup5ever::{ns, small_char_set, TokenizerResult};
 use std::borrow::Cow::{self, Borrowed};
 use std::cell::{Cell, RefCell, RefMut};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::mem;
 
 pub use crate::buffer_queue::{BufferQueue, FromSet, NotFromSet, SetResult};
@@ -105,6 +105,11 @@ impl Default for TokenizerOpts {
     }
 }
 
+/// A tag with at least this many attributes finds duplicate names through a
+/// hash set instead of a scan. Below about 150 attributes the scan is faster,
+/// and it costs at most this many comparisons per attribute.
+const MIN_ATTRS_TO_DEDUP_WITH_SET: usize = 128;
+
 /// The HTML tokenizer.
 pub struct Tokenizer<Sink> {
     /// Options controlling the behavior of the tokenizer.
@@ -152,6 +157,10 @@ pub struct Tokenizer<Sink> {
 
     /// Current tag attributes.
     current_tag_attrs: RefCell<Vec<Attribute>>,
+
+    /// Names of the current tag's attributes, filled once the tag has
+    /// `MIN_ATTRS_TO_DEDUP_WITH_SET` attributes and empty before that.
+    current_tag_attr_names: RefCell<HashSet<LocalName>>,
 
     /// Current attribute name.
     current_attr_name: RefCell<StrTendril>,
@@ -205,6 +214,7 @@ impl<Sink: TokenSink> Tokenizer<Sink> {
             current_tag_self_closing: Cell::new(false),
             current_tag_had_duplicate_attributes: Cell::new(false),
             current_tag_attrs: RefCell::new(vec![]),
+            current_tag_attr_names: RefCell::new(HashSet::new()),
             current_attr_name: RefCell::new(StrTendril::new()),
             current_attr_value: RefCell::new(StrTendril::new()),
             current_comment: RefCell::new(StrTendril::new()),
@@ -463,7 +473,7 @@ impl<Sink: TokenSink> Tokenizer<Sink> {
             kind: self.current_tag_kind.get(),
             name,
             self_closing: self.current_tag_self_closing.get(),
-            attrs: std::mem::take(&mut self.current_tag_attrs.borrow_mut()),
+            attrs: self.take_current_tag_attrs(),
             had_duplicate_attributes: self.current_tag_had_duplicate_attributes.get(),
         });
 
@@ -510,7 +520,16 @@ impl<Sink: TokenSink> Tokenizer<Sink> {
         self.current_tag_name.borrow_mut().clear();
         self.current_tag_self_closing.set(false);
         self.current_tag_had_duplicate_attributes.set(false);
-        *self.current_tag_attrs.borrow_mut() = vec![];
+        self.take_current_tag_attrs();
+    }
+
+    fn take_current_tag_attrs(&self) -> Vec<Attribute> {
+        // Drop the name set rather than clear it: clearing costs time in its
+        // capacity, which one large tag would leave behind for every later tag.
+        if !self.current_tag_attr_names.borrow().is_empty() {
+            self.current_tag_attr_names.take();
+        }
+        mem::take(&mut self.current_tag_attrs.borrow_mut())
     }
 
     fn create_tag(&self, kind: TagKind, c: char) {
@@ -540,24 +559,30 @@ impl<Sink: TokenSink> Tokenizer<Sink> {
             return;
         }
 
+        let name = LocalName::from(&**self.current_attr_name.borrow());
+        self.current_attr_name.borrow_mut().clear();
         // Check for a duplicate attribute.
         // FIXME: the spec says we should error as soon as the name is finished.
         let dup = {
-            let name = &*self.current_attr_name.borrow();
-            self.current_tag_attrs
-                .borrow()
-                .iter()
-                .any(|a| *a.name.local == **name)
+            let attrs = self.current_tag_attrs.borrow();
+            if attrs.len() < MIN_ATTRS_TO_DEDUP_WITH_SET {
+                attrs.iter().any(|a| a.name.local == name)
+            } else {
+                // Scanning the attributes for each new one would make a tag
+                // cost time quadratic in its attribute count.
+                let mut names = self.current_tag_attr_names.borrow_mut();
+                if names.is_empty() {
+                    names.extend(attrs.iter().map(|a| a.name.local.clone()));
+                }
+                !names.insert(name.clone())
+            }
         };
 
         if dup {
             self.emit_error(Borrowed("Duplicate attribute"));
             self.current_tag_had_duplicate_attributes.set(true);
-            self.current_attr_name.borrow_mut().clear();
             self.current_attr_value.borrow_mut().clear();
         } else {
-            let name = LocalName::from(&**self.current_attr_name.borrow());
-            self.current_attr_name.borrow_mut().clear();
             self.current_tag_attrs.borrow_mut().push(Attribute {
                 // The tree builder will adjust the namespace if necessary.
                 // This only happens in foreign elements.
@@ -2295,6 +2320,105 @@ mod test {
         ];
         let results = tokenize(vector, opts);
         assert_eq!(results, expected);
+    }
+
+    // Collects start tags and counts parse errors.
+    #[derive(Default)]
+    struct TagsAndErrors {
+        tags: RefCell<Vec<Tag>>,
+        errors: RefCell<Vec<String>>,
+    }
+
+    impl TokenSink for TagsAndErrors {
+        type Handle = ();
+
+        fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<()> {
+            match token {
+                TagToken(t) if t.kind == StartTag => self.tags.borrow_mut().push(t),
+                ParseError(e) => self.errors.borrow_mut().push(e.into_owned()),
+                _ => (),
+            }
+            TokenSinkResult::Continue
+        }
+    }
+
+    fn tokenize_tags(input: &str) -> TagsAndErrors {
+        let tok = Tokenizer::new(TagsAndErrors::default(), TokenizerOpts::default());
+        let buffer = BufferQueue::default();
+        buffer.push_back(StrTendril::from(input));
+        let _ = tok.feed(&buffer);
+        tok.end();
+        tok.sink
+    }
+
+    fn attrs_of(tag: &Tag) -> Vec<(String, String)> {
+        tag.attrs
+            .iter()
+            .map(|a| (a.name.local.to_string(), a.value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn duplicate_attributes_in_a_tag_with_many_attributes() {
+        // Duplicates of a name read before the tag switches to a name set,
+        // of a name read after it, and one before the switch.
+        let names: Vec<String> = (0..300).map(|i| format!("a{i}")).collect();
+        let mut input = String::from("<p");
+        let mut expected = vec![];
+        for (i, name) in names.iter().enumerate() {
+            input.push_str(&format!(" {name}={i}"));
+            expected.push((name.clone(), i.to_string()));
+            match i {
+                5 => input.push_str(" a0=dup"),
+                200 => input.push_str(" a3=dup"),
+                250 => input.push_str(" a150=dup"),
+                _ => (),
+            }
+        }
+        // The next tag's attributes are checked against its own names only.
+        input.push_str("><b a0=next a3=next>");
+
+        let sink = tokenize_tags(&input);
+        let tags = sink.tags.borrow();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(attrs_of(&tags[0]), expected);
+        assert!(tags[0].had_duplicate_attributes);
+        assert_eq!(
+            attrs_of(&tags[1]),
+            vec![
+                ("a0".to_owned(), "next".to_owned()),
+                ("a3".to_owned(), "next".to_owned())
+            ]
+        );
+        assert!(!tags[1].had_duplicate_attributes);
+        assert_eq!(*sink.errors.borrow(), vec!["Duplicate attribute"; 3]);
+    }
+
+    #[test]
+    fn many_attributes_take_linear_time() {
+        fn seconds(attrs: usize) -> f64 {
+            let mut input = String::from("<p");
+            for i in 0..attrs {
+                input.push_str(&format!(" a{i}=x"));
+            }
+            input.push('>');
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let sink = tokenize_tags(&input);
+                    let elapsed = start.elapsed().as_secs_f64();
+                    assert_eq!(sink.tags.borrow()[0].attrs.len(), attrs);
+                    elapsed
+                })
+                .fold(f64::INFINITY, f64::min)
+        }
+        // Four times the attributes take about four times as long in linear
+        // time and sixteen times as long in quadratic time.
+        let ratio = seconds(64_000) / seconds(16_000);
+        assert!(
+            ratio < 8.0,
+            "64k attributes took {ratio:.1} times as long as 16k"
+        );
     }
 
     #[test]
