@@ -17,7 +17,9 @@ trace_tokenizer = []
 serde = ["markup5ever/serde"]
 
 [dependencies]
-markup5ever = { workspace = true }
+# From the registry, so that a project patching html5ever from git keeps the
+# released markup5ever, tendril and web_atoms; this workspace patches it back.
+markup5ever = "0.39"
 log = { workspace = true }
 
 [dev-dependencies]
