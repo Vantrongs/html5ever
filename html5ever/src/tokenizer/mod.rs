@@ -2322,7 +2322,7 @@ mod test {
         assert_eq!(results, expected);
     }
 
-    // Collects start tags and counts parse errors.
+    // Collects start tags and parse errors.
     #[derive(Default)]
     struct TagsAndErrors {
         tags: RefCell<Vec<Tag>>,
